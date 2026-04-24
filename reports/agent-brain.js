@@ -117,6 +117,25 @@ db.exec(`
     key_insight TEXT,
     created_at  TEXT DEFAULT (datetime('now'))
   );
+
+  -- Гипотезы и их результаты (фильтр эффективных связок)
+  CREATE TABLE IF NOT EXISTS hypotheses (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id       TEXT,
+    category      TEXT,    -- creative, audience, budget, funnel, targeting
+    hypothesis    TEXT,    -- текст гипотезы
+    status        TEXT DEFAULT 'new',  -- new | testing | proven | failed
+    confidence    REAL DEFAULT 0.3,
+    ctr_before    REAL,    -- CTR до теста
+    cpl_before    REAL,    -- CPL до теста
+    ctr_after     REAL,    -- CTR после
+    cpl_after     REAL,    -- CPL после
+    spend_on_test REAL DEFAULT 0,
+    result_note   TEXT,    -- заметка о результате
+    source        TEXT DEFAULT 'ai',  -- ai | owner | auto
+    created_at    TEXT DEFAULT (datetime('now')),
+    updated_at    TEXT DEFAULT (datetime('now'))
+  );
 `);
 
 // ── API для работы с группами ─────────────────────────────────
@@ -215,8 +234,8 @@ export function addInsight(chatId, category, insight, source = 'auto') {
 export function getInsights(chatId, category = null, limit = 10) {
   const cond = category ? 'AND category = ?' : '';
   const args = category
-    ? [String(chatId), String(chatId), category, limit]
-    : [String(chatId), String(chatId), limit];
+    ? [String(chatId), category, limit]
+    : [String(chatId), limit];
   return db.prepare(`
     SELECT * FROM insights
     WHERE (chat_id = ? OR chat_id IS NULL)
@@ -315,6 +334,7 @@ export function buildContext(chatId, userQuestion) {
   const insights = getInsights(chatId, null, 8);
   const trend    = getCampaignTrend(chatId);
   const history  = getRecentHistory(chatId, 8);
+  const proven   = getProvenHypotheses(chatId, 5);
 
   // Ищем релевантные знания по ключевым словам из вопроса
   const keywords = userQuestion.toLowerCase().split(/\s+/)
@@ -323,6 +343,13 @@ export function buildContext(chatId, userQuestion) {
     searchKnowledge(kw, group?.niche, 3)
   );
   const uniqueKnowledge = [...new Map(relevant.map(k => [k.id, k])).values()].slice(0, 6);
+
+  // Также ищем исторические инсайты (source = 'history')
+  const historyInsights = db.prepare(`
+    SELECT * FROM insights
+    WHERE (chat_id = ? OR chat_id IS NULL) AND source = 'history'
+    ORDER BY confidence DESC LIMIT 6
+  `).all(String(chatId));
 
   let ctx = '';
 
@@ -348,12 +375,32 @@ export function buildContext(chatId, userQuestion) {
     ctx += `Расход: $${totalSpend} | Средний CTR: ${avgCtr}% | Средний CPL: $${avgCpl}\n\n`;
   }
 
+  // Проверенные гипотезы (эффективные связки для масштабирования)
+  if (proven.length > 0) {
+    ctx += `## ✅ ПРОВЕРЕННЫЕ ЭФФЕКТИВНЫЕ СВЯЗКИ (масштабировать)\n`;
+    proven.forEach(h => {
+      ctx += `[${h.category}] ${h.hypothesis}`;
+      if (h.result_note) ctx += ` → ${h.result_note}`;
+      ctx += '\n';
+    });
+    ctx += '\n';
+  }
+
   // Накопленные инсайты
   if (insights.length > 0) {
     ctx += `## Накопленные инсайты по этому клиенту\n`;
     insights.forEach(i => {
       const conf = i.confidence >= 0.7 ? '✅' : i.confidence >= 0.4 ? '🟡' : '⚪';
       ctx += `${conf} [${i.category}] ${i.insight}\n`;
+    });
+    ctx += '\n';
+  }
+
+  // Исторические инсайты из архива кабинета
+  if (historyInsights.length > 0) {
+    ctx += `## Инсайты из исторических данных кабинета\n`;
+    historyInsights.forEach(i => {
+      ctx += `📊 [${i.category}] ${i.insight}\n`;
     });
     ctx += '\n';
   }
@@ -406,12 +453,82 @@ export function autoAnalyze(chatId, todayMetrics) {
 
 export function getBrainStats() {
   return {
-    groups:      db.prepare('SELECT COUNT(*) as n FROM groups').get().n,
-    campaigns:   db.prepare('SELECT COUNT(*) as n FROM campaigns').get().n,
-    insights:    db.prepare('SELECT COUNT(*) as n FROM insights').get().n,
-    knowledge:   db.prepare('SELECT COUNT(*) as n FROM knowledge').get().n,
-    conversations: db.prepare('SELECT COUNT(*) as n FROM conversations').get().n,
+    groups:         db.prepare('SELECT COUNT(*) as n FROM groups').get().n,
+    campaigns:      db.prepare('SELECT COUNT(*) as n FROM campaigns').get().n,
+    insights:       db.prepare('SELECT COUNT(*) as n FROM insights').get().n,
+    knowledge:      db.prepare('SELECT COUNT(*) as n FROM knowledge').get().n,
+    conversations:  db.prepare('SELECT COUNT(*) as n FROM conversations').get().n,
+    hypotheses:     db.prepare('SELECT COUNT(*) as n FROM hypotheses').get().n,
+    proven:         db.prepare("SELECT COUNT(*) as n FROM hypotheses WHERE status='proven'").get().n,
+    testing:        db.prepare("SELECT COUNT(*) as n FROM hypotheses WHERE status='testing'").get().n,
   };
+}
+
+// ── Гипотезы ──────────────────────────────────────────────────
+
+export function saveHypothesis(chatId, category, hypothesis, source = 'ai') {
+  // Проверяем нет ли похожей (первые 40 символов)
+  const similar = db.prepare(`
+    SELECT id FROM hypotheses
+    WHERE (chat_id = ? OR chat_id IS NULL)
+    AND hypothesis LIKE ?
+  `).get(String(chatId), `%${hypothesis.slice(0, 40)}%`);
+  if (similar) return similar.id;
+
+  const result = db.prepare(`
+    INSERT INTO hypotheses (chat_id, category, hypothesis, source)
+    VALUES (?, ?, ?, ?)
+  `).run(chatId ? String(chatId) : null, category, hypothesis, source);
+  return result.lastInsertRowid;
+}
+
+export function updateHypothesis(id, status, opts = {}) {
+  const { ctrAfter, cplAfter, resultNote, spendOnTest } = opts;
+  const conf = status === 'proven' ? 0.85 : status === 'failed' ? 0.1 : 0.5;
+  db.prepare(`
+    UPDATE hypotheses SET
+      status = ?, confidence = ?,
+      ctr_after = COALESCE(?, ctr_after),
+      cpl_after = COALESCE(?, cpl_after),
+      spend_on_test = COALESCE(?, spend_on_test),
+      result_note = COALESCE(?, result_note),
+      updated_at = datetime('now')
+    WHERE id = ?
+  `).run(status, conf, ctrAfter || null, cplAfter || null, spendOnTest || null, resultNote || null, id);
+
+  // Proven → автоматически добавляем как инсайт с высокой уверенностью
+  if (status === 'proven') {
+    const h = db.prepare('SELECT * FROM hypotheses WHERE id = ?').get(id);
+    if (h) {
+      const insightText = `✅ ПРОВЕРЕНО: ${h.hypothesis}${resultNote ? ` (${resultNote})` : ''}`;
+      addInsight(h.chat_id, h.category, insightText, 'feedback');
+    }
+  }
+}
+
+export function getHypotheses(chatId, status = null, limit = 20) {
+  const cond = status ? 'AND status = ?' : '';
+  const args = status ? [String(chatId), status, limit] : [String(chatId), limit];
+  return db.prepare(`
+    SELECT * FROM hypotheses
+    WHERE (chat_id = ? OR chat_id IS NULL)
+    ${cond}
+    ORDER BY confidence DESC, created_at DESC
+    LIMIT ?
+  `).all(...args);
+}
+
+export function getProvenHypotheses(chatId, limit = 5) {
+  return db.prepare(`
+    SELECT * FROM hypotheses
+    WHERE (chat_id = ? OR chat_id IS NULL) AND status = 'proven'
+    ORDER BY confidence DESC, updated_at DESC
+    LIMIT ?
+  `).all(String(chatId), limit);
+}
+
+export function getHypothesisById(id) {
+  return db.prepare('SELECT * FROM hypotheses WHERE id = ?').get(id);
 }
 
 export { db };

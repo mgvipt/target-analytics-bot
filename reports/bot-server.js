@@ -14,6 +14,8 @@ import {
   saveMessage, getRecentHistory,
   saveRecommendation, markRecommendation,
   buildContext, autoAnalyze, getBrainStats, db as brainDb,
+  saveHypothesis, updateHypothesis, getHypotheses,
+  getProvenHypotheses, getHypothesisById,
 } from './agent-brain.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -486,6 +488,31 @@ async function sendLongMessage(chatId, text, keyboard = []) {
   }
 }
 
+// Извлекаем гипотезы из текста ответа Claude и сохраняем
+function extractAndSaveHypotheses(text, chatId) {
+  const saved = [];
+  // Формат: [ГИПОТЕЗА: category | text] или [HYPOTHESIS: category | text]
+  const regex = /\[(?:ГИПОТЕЗА|HYPOTHESIS|ГІПОТЕЗА):\s*([^|]+?)\s*\|\s*([^\]]+)\]/gi;
+  let m;
+  while ((m = regex.exec(text)) !== null) {
+    const category = m[1].trim().toLowerCase();
+    const hypothesis = m[2].trim();
+    const id = saveHypothesis(chatId, category, hypothesis, 'ai');
+    saved.push({ id, category, hypothesis });
+  }
+
+  // Также ищем мягкие маркеры — строки начинающиеся с «Гипотеза:» или «💡 Тест:»
+  const softRegex = /^(?:💡\s*)?(?:Гипотез[аяу]|Тест|Hypothesis):\s*(.+)$/gim;
+  while ((m = softRegex.exec(text)) !== null) {
+    const hypothesis = m[1].trim();
+    if (hypothesis.length > 20) {
+      const id = saveHypothesis(chatId, 'general', hypothesis, 'ai');
+      saved.push({ id, category: 'general', hypothesis });
+    }
+  }
+  return saved;
+}
+
 // AI с памятью — использует базу знаний и историю группы
 async function askClaudeWithBrain(userMessage, brainContext, history, chatId, adsData = null) {
   if (!process.env.ANTHROPIC_API_KEY) return null;
@@ -503,6 +530,13 @@ async function askClaudeWithBrain(userMessage, brainContext, history, chatId, ad
 - Пиши кратко и по делу, без воды. Используй эмодзи для структуры.
 - Отвечай на языке пользователя (русский/украинский)
 
+ВАЖНО — формат гипотез: Когда предлагаешь что-то протестировать, оформляй как:
+[ГИПОТЕЗА: категория | конкретная гипотеза с ожидаемым результатом]
+Категории: creative, audience, budget, funnel, targeting, copy, format
+Пример: [ГИПОТЕЗА: creative | Видео с результатом "до/после" даст CTR 2%+ vs текущие 1.2%]
+
+Проверенные связки из истории — приоритет при масштабировании бюджета.
+
 ${brainContext ? `## Контекст клиента и накопленные данные:\n${brainContext}` : ''}
 ${adsSummary ? `## Текущие данные рекламы:\n${adsSummary}` : ''}`;
 
@@ -518,7 +552,18 @@ ${adsSummary ? `## Текущие данные рекламы:\n${adsSummary}` :
     system: systemPrompt,
     messages,
   });
-  return response.content[0]?.text || null;
+
+  const responseText = response.content[0]?.text || null;
+
+  // Автоматически извлекаем и сохраняем гипотезы из ответа
+  if (responseText && chatId) {
+    const hyps = extractAndSaveHypotheses(responseText, chatId);
+    if (hyps.length > 0) {
+      console.log(`💡 Сохранено ${hyps.length} гипотез из ответа (chat: ${chatId})`);
+    }
+  }
+
+  return responseText;
 }
 
 async function askClaude(userMessage, data, datePreset = 'last_30d') {
@@ -1012,6 +1057,51 @@ bot.on('callback_query', async (query) => {
     return;
   }
 
+  // Show hypotheses — эффективные связки для масштабирования
+  if (data === 'show_hypotheses') {
+    const proven  = getProvenHypotheses(String(chatId), 8);
+    const testing = getHypotheses(String(chatId), 'testing', 5);
+    const fresh   = getHypotheses(String(chatId), 'new', 5);
+
+    let msg = `💡 <b>Гипотезы и эффективные связки</b>\n\n`;
+
+    if (proven.length > 0) {
+      msg += `✅ <b>ПРОВЕРЕНО — масштабировать:</b>\n`;
+      proven.forEach(h => {
+        msg += `• [${h.category}] ${h.hypothesis.slice(0, 100)}`;
+        if (h.result_note) msg += `\n  → ${h.result_note}`;
+        msg += '\n';
+      });
+      msg += '\n';
+    }
+
+    if (testing.length > 0) {
+      msg += `🔬 <b>В тестировании:</b>\n`;
+      testing.forEach(h => {
+        msg += `• #${h.id} [${h.category}] ${h.hypothesis.slice(0, 80)}\n`;
+      });
+      msg += '\n';
+    }
+
+    if (fresh.length > 0) {
+      msg += `🆕 <b>Новые (ещё не тестировали):</b>\n`;
+      fresh.forEach(h => {
+        msg += `• #${h.id} [${h.category}] ${h.hypothesis.slice(0, 80)}\n`;
+      });
+      msg += '\n';
+    }
+
+    if (proven.length === 0 && testing.length === 0 && fresh.length === 0) {
+      msg += `Гипотез пока нет. Они появляются автоматически когда ты общаешься с AI-агентом.\n\n`
+           + `Также можно добавить вручную через личку владельца: /hyp категория | гипотеза`;
+    } else {
+      msg += `<i>Управление через личку: /proven ID, /failed ID, /testing ID</i>`;
+    }
+
+    await safeSend(chatId, msg);
+    return;
+  }
+
   // Show help
   if (data === 'show_help') {
     const help = `🤖 <b>ТАРГЕТ АНАЛИТИКА — Инструкция</b>\n`
@@ -1249,8 +1339,11 @@ function buildStartKeyboard() {
     ],
     [
       { text: '💳 Биллинг',        callback_data: 'show_billing' },
-      { text: '➕ Новая кампания', callback_data: 'new_campaign' },
-      { text: '📊 Таблица',        url: SHEET_URL },
+      { text: '💡 Гипотезы',       callback_data: 'show_hypotheses' },
+      { text: '➕ Кампания',        callback_data: 'new_campaign' },
+    ],
+    [
+      { text: '📊 Таблица', url: SHEET_URL },
     ],
   ];
 }
@@ -1420,7 +1513,10 @@ bot.on('message', async (msg) => {
         + `📊 Кампаний: <b>${stats.campaigns}</b>\n`
         + `💡 Инсайтов: <b>${stats.insights}</b>\n`
         + `📚 Знаний: <b>${stats.knowledge}</b>\n`
-        + `💬 Сообщений: <b>${stats.conversations}</b>`
+        + `💬 Сообщений: <b>${stats.conversations}</b>\n`
+        + `🧪 Гипотез всего: <b>${stats.hypotheses}</b>\n`
+        + `✅ Доказанных: <b>${stats.proven}</b>\n`
+        + `🔬 Тестируются: <b>${stats.testing}</b>`
       );
       return;
     }
@@ -1453,6 +1549,89 @@ bot.on('message', async (msg) => {
         return `${conf} [${i.category}] ${i.insight.slice(0, 120)}`;
       }).join('\n\n');
       await safeSend(chatId, `💡 <b>Накопленные инсайты (${items.length}):</b>\n\n${list}`);
+      return;
+    }
+
+    // /hyp — добавить гипотезу вручную
+    // Формат: /hyp категория | гипотеза
+    if (text.startsWith('/hyp ') || text.startsWith('/hypothesis ')) {
+      const content = text.startsWith('/hyp ') ? text.slice(5).trim() : text.slice(11).trim();
+      const parts = content.split('|').map(s => s.trim());
+      if (parts.length >= 2) {
+        const id = saveHypothesis(null, parts[0].toLowerCase(), parts[1], 'owner');
+        await safeSend(chatId, `🧪 Гипотеза #${id} сохранена!\n\n[${parts[0]}] ${parts[1]}\n\nКогда протестируешь — /proven ${id} результат`);
+      } else {
+        await safeSend(chatId,
+          `🧪 <b>Добавить гипотезу</b>\n\nФормат:\n<code>/hyp категория | текст гипотезы</code>\n\nКатегории: creative, audience, budget, funnel, targeting, copy, format\n\nПример:\n<code>/hyp creative | Видео "до/после" даст CTR 2%+ против текущих 1.2%</code>`
+        );
+      }
+      return;
+    }
+
+    // /hypotheses [status] — список гипотез
+    if (text.startsWith('/hypotheses') || text === '/гипотезы') {
+      const statusArg = text.split(' ')[1] || null; // new | testing | proven | failed
+      const items = getHypotheses(null, statusArg, 15);
+      if (items.length === 0) {
+        await safeSend(chatId, `🧪 Гипотез${statusArg ? ` со статусом "${statusArg}"` : ''} пока нет.\n\nДобавить: /hyp категория | текст`);
+        return;
+      }
+      const statusEmoji = { new: '🆕', testing: '🔬', proven: '✅', failed: '❌' };
+      const list = items.map(h =>
+        `${statusEmoji[h.status] || '⚪'} #${h.id} [${h.category}]\n${h.hypothesis.slice(0, 100)}${h.result_note ? `\n→ ${h.result_note}` : ''}`
+      ).join('\n\n');
+      await safeSend(chatId,
+        `🧪 <b>Гипотезы${statusArg ? ` (${statusArg})` : ''}:</b>\n\n${list}\n\n`
+        + `<i>/proven ID результат — отметить как рабочую\n/failed ID — отметить как неработающую\n/testing ID — начать тестирование</i>`
+      );
+      return;
+    }
+
+    // /proven ID [заметка] — отметить гипотезу как проверенную (работает!)
+    if (text.startsWith('/proven ')) {
+      const parts = text.slice(8).trim().split(' ');
+      const id = parseInt(parts[0]);
+      const note = parts.slice(1).join(' ').trim();
+      if (!id) { await safeSend(chatId, '❌ Укажи ID: /proven 5 CTR вырос с 1.2% до 2.8%'); return; }
+      const h = getHypothesisById(id);
+      if (!h) { await safeSend(chatId, `❌ Гипотеза #${id} не найдена`); return; }
+      updateHypothesis(id, 'proven', { resultNote: note || null });
+      await safeSend(chatId,
+        `✅ <b>Гипотеза #${id} доказана!</b>\n\n[${h.category}] ${h.hypothesis}\n\n`
+        + `${note ? `📊 Результат: ${note}\n\n` : ''}`
+        + `💡 Добавлена как инсайт с высокой уверенностью. Агент будет рекомендовать масштабировать эту связку.`
+      );
+      return;
+    }
+
+    // /failed ID [заметка] — отметить гипотезу как неработающую
+    if (text.startsWith('/failed ')) {
+      const parts = text.slice(8).trim().split(' ');
+      const id = parseInt(parts[0]);
+      const note = parts.slice(1).join(' ').trim();
+      if (!id) { await safeSend(chatId, '❌ Укажи ID: /failed 3 CTR не изменился'); return; }
+      const h = getHypothesisById(id);
+      if (!h) { await safeSend(chatId, `❌ Гипотеза #${id} не найдена`); return; }
+      updateHypothesis(id, 'failed', { resultNote: note || null });
+      await safeSend(chatId,
+        `❌ <b>Гипотеза #${id} не сработала</b>\n\n[${h.category}] ${h.hypothesis}\n\n`
+        + `${note ? `📊 Результат: ${note}\n\n` : ''}`
+        + `Агент учтёт это и не будет повторно рекомендовать.`
+      );
+      return;
+    }
+
+    // /testing ID — начать тестирование гипотезы
+    if (text.startsWith('/testing ')) {
+      const id = parseInt(text.slice(9).trim());
+      if (!id) { await safeSend(chatId, '❌ Укажи ID: /testing 5'); return; }
+      const h = getHypothesisById(id);
+      if (!h) { await safeSend(chatId, `❌ Гипотеза #${id} не найдена`); return; }
+      updateHypothesis(id, 'testing');
+      await safeSend(chatId,
+        `🔬 <b>Тестирование #${id} запущено</b>\n\n[${h.category}] ${h.hypothesis}\n\n`
+        + `Когда будет результат:\n✅ /proven ${id} описание результата\n❌ /failed ${id} что не сработало`
+      );
       return;
     }
 
