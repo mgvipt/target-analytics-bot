@@ -1,0 +1,9 @@
+node_modules/
+.env
+sheets-token.json
+drive-token.json
+*.json.bak
+logs/
+tmp-*.docx
+*.log
+.DS_Store
