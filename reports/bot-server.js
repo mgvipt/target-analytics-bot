@@ -6,6 +6,15 @@ import { fileURLToPath } from 'url';
 import { generateBothLocal, generateAndUpload, fetchAllData } from './generate-reports.js';
 import Anthropic from '@anthropic-ai/sdk';
 import { google } from 'googleapis';
+import {
+  getGroup, upsertGroup,
+  saveCampaignMetrics, getCampaignTrend,
+  addInsight, getInsights, markInsightHelpful,
+  addKnowledge, searchKnowledge, getKnowledgeByTopic,
+  saveMessage, getRecentHistory,
+  saveRecommendation, markRecommendation,
+  buildContext, autoAnalyze, getBrainStats, db as brainDb,
+} from './agent-brain.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -475,6 +484,41 @@ async function sendLongMessage(chatId, text, keyboard = []) {
     const isLast = i === chunks.length - 1;
     await safeSend(chatId, chunks[i].trim(), isLast ? { reply_markup: { inline_keyboard: keyboard } } : {});
   }
+}
+
+// AI с памятью — использует базу знаний и историю группы
+async function askClaudeWithBrain(userMessage, brainContext, history, chatId, adsData = null) {
+  if (!process.env.ANTHROPIC_API_KEY) return null;
+  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+  const adsSummary = adsData ? buildDataSummary(adsData) : '';
+
+  const systemPrompt = `Ты — профессиональный маркетолог-аналитик со специализацией в таргетированной рекламе Meta Ads (Facebook/Instagram), SMM, воронках продаж и увеличении конверсии.
+
+Твои принципы:
+- Давай конкретные, измеримые рекомендации (не "улучши CTR", а "протестируй хук с болью ЦА, цель CTR 2%+")
+- Используй реальные данные клиента из контекста
+- Всегда объясняй ПОЧЕМУ, не только ЧТО делать
+- Если данных недостаточно — честно скажи и задай уточняющий вопрос
+- Пиши кратко и по делу, без воды. Используй эмодзи для структуры.
+- Отвечай на языке пользователя (русский/украинский)
+
+${brainContext ? `## Контекст клиента и накопленные данные:\n${brainContext}` : ''}
+${adsSummary ? `## Текущие данные рекламы:\n${adsSummary}` : ''}`;
+
+  // Формируем историю сообщений
+  const messages = [
+    ...history.map(h => ({ role: h.role, content: h.message })),
+    { role: 'user', content: userMessage },
+  ];
+
+  const response = await client.messages.create({
+    model: 'claude-opus-4-5',
+    max_tokens: 1500,
+    system: systemPrompt,
+    messages,
+  });
+  return response.content[0]?.text || null;
 }
 
 async function askClaude(userMessage, data, datePreset = 'last_30d') {
@@ -1311,6 +1355,121 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // ── Управление агентом через личку (только владелец) ─────────
+  const isOwner = String(chatId) === String(TG_PERSONAL);
+  if (isOwner && text.trim()) {
+
+    // /teach — добавить знание в базу
+    // Формат: /teach [тема] | [подтема] | [знание]
+    if (text.startsWith('/teach')) {
+      const parts = text.slice(6).trim().split('|').map(s => s.trim());
+      if (parts.length >= 3) {
+        addKnowledge(parts[0], parts[1], parts[2], parts[3] || 'universal', 9);
+        await safeSend(chatId, `✅ Знание добавлено!\n\n📚 <b>${parts[0]} / ${parts[1]}</b>\n${parts[2]}`);
+      } else {
+        await safeSend(chatId,
+          `📚 <b>Добавить знание</b>\n\nФормат:\n<code>/teach тема | подтема | текст знания</code>\n\nПример:\n<code>/teach воронка | email | Письма с персонализацией открывают на 26% чаще</code>`
+        );
+      }
+      return;
+    }
+
+    // /insight — добавить инсайт вручную
+    // Формат: /insight [категория] | [текст]
+    if (text.startsWith('/insight')) {
+      const parts = text.slice(8).trim().split('|').map(s => s.trim());
+      if (parts.length >= 2) {
+        addInsight(null, parts[0], parts[1], 'manual'); // глобальный инсайт
+        await safeSend(chatId, `✅ Инсайт сохранён!\n\n💡 [${parts[0]}] ${parts[1]}`);
+      } else {
+        await safeSend(chatId,
+          `💡 <b>Добавить инсайт</b>\n\nФормат:\n<code>/insight категория | текст инсайта</code>\n\nПример:\n<code>/insight аудитория | Женщины 35-44 лучше конвертируют в декоре чем 25-34</code>`
+        );
+      }
+      return;
+    }
+
+    // /profile @группа — задать профиль группы
+    // Формат: /profile chatId | ниша | продукт | ЦА | цели
+    if (text.startsWith('/profile')) {
+      const parts = text.slice(8).trim().split('|').map(s => s.trim());
+      if (parts.length >= 2) {
+        const targetChat = parts[0];
+        upsertGroup(targetChat, {
+          niche:    parts[1] || '',
+          product:  parts[2] || '',
+          audience: parts[3] || '',
+          goals:    parts[4] || '',
+          context:  parts[5] || '',
+        });
+        await safeSend(chatId, `✅ Профиль группы <code>${targetChat}</code> обновлён!\n\nНиша: ${parts[1]}\nПродукт: ${parts[2]}\nЦА: ${parts[3]}`);
+      } else {
+        await safeSend(chatId,
+          `👤 <b>Задать профиль группы</b>\n\nФормат:\n<code>/profile chatId | ниша | продукт | ЦА | цели</code>\n\nПример:\n<code>/profile -100123456 | декор | стеновые панели | женщины 30-45 | лиды, продажи</code>`
+        );
+      }
+      return;
+    }
+
+    // /brain — статистика базы знаний
+    if (text === '/brain') {
+      const stats = getBrainStats();
+      await safeSend(chatId,
+        `🧠 <b>База знаний агента</b>\n\n`
+        + `👥 Групп: <b>${stats.groups}</b>\n`
+        + `📊 Кампаний: <b>${stats.campaigns}</b>\n`
+        + `💡 Инсайтов: <b>${stats.insights}</b>\n`
+        + `📚 Знаний: <b>${stats.knowledge}</b>\n`
+        + `💬 Сообщений: <b>${stats.conversations}</b>`
+      );
+      return;
+    }
+
+    // /knowlist [тема] — посмотреть знания по теме
+    if (text.startsWith('/knowlist')) {
+      const topic = text.slice(9).trim();
+      const items = topic
+        ? getKnowledgeByTopic(topic, null, 10)
+        : brainDb.prepare('SELECT DISTINCT topic, COUNT(*) as n FROM knowledge GROUP BY topic').all();
+      if (!topic) {
+        const list = items.map(r => `📌 <b>${r.topic}</b>: ${r.n} записей`).join('\n');
+        await safeSend(chatId, `📚 <b>Темы в базе знаний:</b>\n\n${list}\n\n<i>Напиши /knowlist тема для просмотра</i>`);
+      } else {
+        const list = items.map((k, i) => `${i+1}. [${k.subtopic}] ${k.content.slice(0, 100)}...`).join('\n\n');
+        await safeSend(chatId, `📚 <b>${topic}</b> (${items.length} записей):\n\n${list}`);
+      }
+      return;
+    }
+
+    // /insightlist — посмотреть все инсайты
+    if (text === '/insightlist') {
+      const items = getInsights(null, null, 20);
+      if (items.length === 0) {
+        await safeSend(chatId, '💡 Инсайтов пока нет. Они накапливаются автоматически из данных.');
+        return;
+      }
+      const list = items.map(i => {
+        const conf = i.confidence >= 0.7 ? '✅' : i.confidence >= 0.4 ? '🟡' : '⚪';
+        return `${conf} [${i.category}] ${i.insight.slice(0, 120)}`;
+      }).join('\n\n');
+      await safeSend(chatId, `💡 <b>Накопленные инсайты (${items.length}):</b>\n\n${list}`);
+      return;
+    }
+
+    // Обычное сообщение от владельца в личке — AI с контекстом всей системы
+    if (!text.startsWith('/')) {
+      await bot.sendChatAction(chatId, 'typing');
+      saveMessage(String(chatId), 'user', text);
+      const { ctx, history } = buildContext(String(chatId), text);
+      const answer = await askClaudeWithBrain(text, ctx, history, chatId);
+      if (answer) {
+        saveMessage(String(chatId), 'assistant', answer);
+        await safeSend(chatId, answer);
+      }
+      return;
+    }
+  }
+
   // Wizard text input — check first
   if (wizardState.has(chatId)) {
     const handled = await handleWizardMessage(chatId, text);
@@ -1326,20 +1485,28 @@ bot.on('message', async (msg) => {
       return;
     }
 
-    // Show typing indicator
     await bot.sendChatAction(chatId, 'typing');
+    saveMessage(String(chatId), 'user', text);
 
     try {
-      const datePreset  = detectPeriod(text);
-      const periodName  = getPeriodName(datePreset);
+      const { ctx, history } = buildContext(String(chatId), text);
+      const datePreset = detectPeriod(text);
       const data = await getDataWithCache(datePreset).catch(() => null);
-      const answer = await askClaude(text, data, datePreset);
+
+      // Используем умный AI с памятью если есть контекст группы, иначе обычный
+      const group = getGroup(String(chatId));
+      let answer;
+      if (group || history.length > 0) {
+        answer = await askClaudeWithBrain(text, ctx, history, chatId, data);
+      } else {
+        answer = await askClaude(text, data, datePreset);
+      }
+
       if (answer) {
-        // Append period hint if non-default
-        const hint = datePreset !== 'last_30d'
-          ? `\n\n<i>📅 Данные за: ${periodName}</i>`
-          : `\n\n<i>📅 Данные за: ${periodName}</i>`;
-        await safeSend(chatId, answer + hint);
+        saveMessage(String(chatId), 'assistant', answer);
+        // Автосохраняем рекомендации
+        if (answer.length > 100) saveRecommendation(String(chatId), text.slice(0,100), answer.slice(0,300));
+        await safeSend(chatId, answer);
       } else {
         await bot.sendMessage(chatId, '⚠️ Не удалось получить ответ от AI. Попробуй позже.');
       }
