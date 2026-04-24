@@ -31,8 +31,8 @@ const AD_ACCOUNT = process.env.META_AD_ACCOUNT_ID;
 const IG_ID      = process.env.META_IG_ACCOUNT_ID;
 const API_VER    = process.env.META_API_VERSION || 'v21.0';
 const BASE_URL   = `https://graph.facebook.com/${API_VER}`;
-const SHEET_URL  = 'https://docs.google.com/spreadsheets/d/1jTpm2cF3q_a7lNMbdAFQES0rWhd8noqhYsMMognHA3g';
-const SHEET_ID   = '1jTpm2cF3q_a7lNMbdAFQES0rWhd8noqhYsMMognHA3g';
+const SHEET_ID   = process.env.GOOGLE_SHEET_ID || '';
+const SHEET_URL  = `https://docs.google.com/spreadsheets/d/${SHEET_ID}`;
 const MONTH_NAMES_RU = ['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
 
 // ── Google Sheets client (lazy init) ──────────────────────────

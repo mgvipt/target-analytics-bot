@@ -7,8 +7,8 @@ Telegram-бот для управления рекламой в Meta Ads (Facebo
 
 ## Сервер
 
-- **IP**: 46.225.71.162
-- **SSH**: `ssh -i ~/.ssh/hetzner_key root@46.225.71.162`
+- **IP**: YOUR_SERVER_IP
+- **SSH**: `ssh -i ~/.ssh/hetzner_key root@YOUR_SERVER_IP`
 - **Пароль**: хранится у владельца
 - **Timezone**: Europe/Kyiv (UTC+3)
 - **PM2 процесс**: `tg-bot` → `/root/bot/reports/bot-server.js`
@@ -19,10 +19,10 @@ Telegram-бот для управления рекламой в Meta Ads (Facebo
 
 ```bash
 # 1. Загрузить новый bot-server.js на сервер
-sshpass -p 'PASS' scp reports/bot-server.js root@46.225.71.162:/root/bot/reports/
+sshpass -p 'PASS' scp reports/bot-server.js root@YOUR_SERVER_IP:/root/bot/reports/
 
 # 2. Перезапустить
-sshpass -p 'PASS' ssh root@46.225.71.162 "pm2 restart tg-bot --update-env"
+sshpass -p 'PASS' ssh root@YOUR_SERVER_IP "pm2 restart tg-bot --update-env"
 ```
 
 ## Главный файл бота
@@ -54,7 +54,7 @@ sshpass -p 'PASS' ssh root@46.225.71.162 "pm2 restart tg-bot --update-env"
 
 ## Google Sheets
 
-**ID таблицы**: `1jTpm2cF3q_a7lNMbdAFQES0rWhd8noqhYsMMognHA3g`
+**ID таблицы**: `YOUR_GOOGLE_SHEET_ID`
 
 ### Структура листа "Апрель 2026" (и каждый месяц)
 - Строки B:AE = дни месяца (B=1, C=2, ..., AE=30/31)
@@ -156,12 +156,12 @@ meta-ads-mcp/
 
 ```bash
 # Посмотреть логи сервера
-ssh -i ~/.ssh/hetzner_key root@46.225.71.162 "pm2 logs tg-bot --lines 30"
+ssh -i ~/.ssh/hetzner_key root@YOUR_SERVER_IP "pm2 logs tg-bot --lines 30"
 
 # Статус PM2
-ssh -i ~/.ssh/hetzner_key root@46.225.71.162 "pm2 status"
+ssh -i ~/.ssh/hetzner_key root@YOUR_SERVER_IP "pm2 status"
 
 # Задеплоить изменения
-sshpass -p 'PASS' scp reports/bot-server.js root@46.225.71.162:/root/bot/reports/ && \
-sshpass -p 'PASS' ssh root@46.225.71.162 "pm2 restart tg-bot --update-env"
+sshpass -p 'PASS' scp reports/bot-server.js root@YOUR_SERVER_IP:/root/bot/reports/ && \
+sshpass -p 'PASS' ssh root@YOUR_SERVER_IP "pm2 restart tg-bot --update-env"
 ```
