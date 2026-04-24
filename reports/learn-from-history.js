@@ -26,9 +26,10 @@ for (const line of envContent.split('\n')) {
 
 const TOKEN    = process.env.META_ACCESS_TOKEN;
 const BASE     = 'https://graph.facebook.com/v21.0';
-// Support extra account via CLI arg
-const ACCOUNTS = [process.env.META_AD_ACCOUNT_ID];
-if (process.argv[2]) ACCOUNTS.push(process.argv[2]);
+// If CLI arg provided → only that account; without arg → main account
+const ACCOUNTS = process.argv[2]
+  ? [process.argv[2]]
+  : [process.env.META_AD_ACCOUNT_ID];
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
