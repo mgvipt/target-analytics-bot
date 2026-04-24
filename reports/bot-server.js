@@ -37,14 +37,18 @@ try {
 const TG_TOKEN        = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT         = process.env.TELEGRAM_CHAT_ID;
 const TG_PERSONAL     = process.env.TELEGRAM_PERSONAL_CHAT_ID || ''; // personal DM for critical alerts
-const META_TOKEN = process.env.META_ACCESS_TOKEN;
-const AD_ACCOUNT = process.env.META_AD_ACCOUNT_ID;
-const IG_ID      = process.env.META_IG_ACCOUNT_ID;
-const API_VER    = process.env.META_API_VERSION || 'v21.0';
-const BASE_URL   = `https://graph.facebook.com/${API_VER}`;
-const SHEET_ID   = process.env.GOOGLE_SHEET_ID || '';
-const SHEET_URL  = `https://docs.google.com/spreadsheets/d/${SHEET_ID}`;
+const META_TOKEN  = process.env.META_ACCESS_TOKEN;
+const AD_ACCOUNT  = process.env.META_AD_ACCOUNT_ID;
+const AD_ACCOUNT2 = process.env.META_AD_ACCOUNT_ID_2 || ''; // second ad account (optional)
+const IG_ID       = process.env.META_IG_ACCOUNT_ID;
+const API_VER     = process.env.META_API_VERSION || 'v21.0';
+const BASE_URL    = `https://graph.facebook.com/${API_VER}`;
+const SHEET_ID    = process.env.GOOGLE_SHEET_ID || '';
+const SHEET_URL   = `https://docs.google.com/spreadsheets/d/${SHEET_ID}`;
 const MONTH_NAMES_RU = ['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
+
+// All active accounts (filter empty)
+const ALL_ACCOUNTS = [AD_ACCOUNT, AD_ACCOUNT2].filter(Boolean);
 
 // ── Google Sheets client (lazy init) ──────────────────────────
 let sheetsClient = null;
@@ -177,6 +181,16 @@ const wizardState = new Map();
 // Pending action (period selection flow)
 // Map<chatId, { action: 'full_report'|'upload_drive' }>
 const pendingAction = new Map();
+
+// Active account selection per chat (default = main account)
+const selectedAccount = new Map();
+function getActiveAccount(chatId) {
+  return selectedAccount.get(String(chatId)) || AD_ACCOUNT;
+}
+function getAccountLabel(accountId) {
+  if (!AD_ACCOUNT2) return '';
+  return accountId === AD_ACCOUNT ? '🏦 Кабинет 1' : '🏦 Кабинет 2';
+}
 
 const bot = new TelegramBot(TG_TOKEN, { polling: true });
 
@@ -1141,28 +1155,45 @@ bot.on('callback_query', async (query) => {
     return;
   }
 
-  // Show status
+  // Show status (campaigns) — for all accounts
   if (data === 'show_status') {
-    const campaigns = await metaGet(`/${AD_ACCOUNT}/campaigns`, {
-      fields: 'id,name,status,daily_budget,start_time',
-      effective_status: JSON.stringify(['ACTIVE']),
-      limit: 20,
-    });
-    const active = campaigns.data || [];
-    let msg2 = `📈 <b>Активные кампании (${active.length})</b>\n\n`;
-    for (const c of active) {
-      const b = c.daily_budget ? `$${(parseInt(c.daily_budget)/100).toFixed(0)}/д` : 'без бюджета';
-      const days = c.start_time ? Math.floor((Date.now() - new Date(c.start_time)) / 86400000) : '?';
-      const tag = days < 7 ? ` 🔄 обучение (${days}д)` : '';
-      msg2 += `• <b>${c.name}</b> — ${b}${tag}\n`;
+    let msg2 = `📈 <b>Активные кампании</b>\n`;
+    const statusKeyboard = [];
+    for (const accId of ALL_ACCOUNTS) {
+      const label = getAccountLabel(accId);
+      const campaigns = await metaGet(`/${accId}/campaigns`, {
+        fields: 'id,name,status,daily_budget,start_time',
+        effective_status: JSON.stringify(['ACTIVE']),
+        limit: 20,
+      });
+      const active = campaigns.data || [];
+      if (ALL_ACCOUNTS.length > 1) msg2 += `\n${label || accId} (${active.length}):\n`;
+      for (const c of active) {
+        const b = c.daily_budget ? `$${(parseInt(c.daily_budget)/100).toFixed(0)}/д` : 'без бюджета';
+        const days = c.start_time ? Math.floor((Date.now() - new Date(c.start_time)) / 86400000) : '?';
+        const tag = days < 7 ? ` 🔄 (${days}д)` : '';
+        msg2 += `• <b>${c.name}</b> — ${b}${tag}\n`;
+      }
     }
-    msg2 += `\n<i>🔄 обучение — не трогать первые 7 дней</i>`;
+    msg2 += `\n<i>🔄 — обучение, не трогать 7 дней</i>`;
+    statusKeyboard.push([{ text: '📊 Полный отчёт', callback_data: 'full_report' }, { text: '➕ Новая кампания', callback_data: 'new_campaign' }]);
     await bot.sendMessage(chatId, msg2, {
       parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [
-        [{ text: '📊 Полный отчёт', callback_data: 'full_report' }, { text: '➕ Новая кампания', callback_data: 'new_campaign' }],
-      ]}
+      reply_markup: { inline_keyboard: statusKeyboard }
     });
+    return;
+  }
+
+  // Switch active account
+  if (data.startsWith('switch_account:')) {
+    const parts = data.split(':');
+    const newAccId = parts[1];
+    const returnTo = parts[2] || 'adsets'; // adsets | ads
+    selectedAccount.set(String(chatId), newAccId);
+    const label = getAccountLabel(newAccId);
+    await bot.answerCallbackQuery(query.id, { text: `✅ Переключено на ${label}` });
+    if (returnTo === 'ads') await sendAdsReport(chatId);
+    else await sendAdsetsReport(chatId);
     return;
   }
 
@@ -1704,12 +1735,14 @@ bot.on('message', async (msg) => {
 // ─── Adsets report ───────────────────────────────────────────
 async function sendAdsetsReport(chatId) {
   try {
-    await bot.sendMessage(chatId, '⏳ Загружаю группы объявлений...');
+    const accId = getActiveAccount(chatId);
+    const accLabel = getAccountLabel(accId);
+    await bot.sendMessage(chatId, `⏳ Загружаю группы${accLabel ? ` (${accLabel})` : ''}...`);
 
     const [campsRes, adsetsRes, insRes] = await Promise.all([
-      metaGet(`/${AD_ACCOUNT}/campaigns`, { fields: 'id,name,status,daily_budget', limit: 50 }),
-      metaGet(`/${AD_ACCOUNT}/adsets`,    { fields: 'id,name,status,daily_budget,campaign_id', limit: 100 }),
-      metaGet(`/${AD_ACCOUNT}/insights`,  {
+      metaGet(`/${accId}/campaigns`, { fields: 'id,name,status,daily_budget', limit: 50 }),
+      metaGet(`/${accId}/adsets`,    { fields: 'id,name,status,daily_budget,campaign_id', limit: 100 }),
+      metaGet(`/${accId}/insights`,  {
         fields: 'adset_id,adset_name,spend,ctr,frequency,impressions',
         level: 'adset', date_preset: 'last_7d', limit: 200,
       }),
@@ -1732,7 +1765,7 @@ async function sendAdsetsReport(chatId) {
       byCamp[a.campaign_id].push(a);
     }
 
-    let msg = `📂 <b>Группы объявлений</b>\n<i>Статистика за 7 дней</i>\n──────────────\n`;
+    let msg = `📂 <b>Группы объявлений</b>${accLabel ? ` ${accLabel}` : ''}\n<i>Статистика за 7 дней</i>\n──────────────\n`;
     const keyboard = [];
 
     for (const [campId, campAdsets] of Object.entries(byCamp)) {
@@ -1766,6 +1799,13 @@ async function sendAdsetsReport(chatId) {
     }
     msg += `\n<i>💡 CBO — бюджет кампании. +/-20% изменяет бюджет кампании.</i>`;
 
+    // Add account switcher button if second account configured
+    if (AD_ACCOUNT2) {
+      const otherAcc = accId === AD_ACCOUNT ? AD_ACCOUNT2 : AD_ACCOUNT;
+      const otherLabel = accId === AD_ACCOUNT ? 'Кабинет 2' : 'Кабинет 1';
+      keyboard.push([{ text: `🔄 Переключить → ${otherLabel}`, callback_data: `switch_account:${otherAcc}:adsets` }]);
+    }
+
     await sendLongMessage(chatId, msg, keyboard);
   } catch (e) {
     console.error('sendAdsetsReport error:', e.message);
@@ -1776,14 +1816,16 @@ async function sendAdsetsReport(chatId) {
 // ─── Ads (individual) report ─────────────────────────────────
 async function sendAdsReport(chatId) {
   try {
-    await bot.sendMessage(chatId, '⏳ Загружаю объявления...');
+    const accId = getActiveAccount(chatId);
+    const accLabel = getAccountLabel(accId);
+    await bot.sendMessage(chatId, `⏳ Загружаю объявления${accLabel ? ` (${accLabel})` : ''}...`);
 
     const [adsRes, insRes] = await Promise.all([
-      metaGet(`/${AD_ACCOUNT}/ads`, {
+      metaGet(`/${accId}/ads`, {
         fields: 'id,name,status,adset_id,campaign_id',
         limit: 100,
       }),
-      metaGet(`/${AD_ACCOUNT}/insights`, {
+      metaGet(`/${accId}/insights`, {
         fields: 'ad_id,ad_name,campaign_name,adset_name,spend,ctr,impressions,cpm,frequency,actions',
         level: 'ad', date_preset: 'last_7d', limit: 200,
       }),
@@ -1812,7 +1854,7 @@ async function sendAdsReport(chatId) {
       byCamp[campName].push(a);
     }
 
-    let msg = `🎨 <b>Объявления</b>\n<i>Статистика за 7 дней</i>\n──────────────\n`;
+    let msg = `🎨 <b>Объявления</b>${accLabel ? ` ${accLabel}` : ''}\n<i>Статистика за 7 дней</i>\n──────────────\n`;
     const keyboard = [];
     let shown = 0;
 
@@ -1847,6 +1889,13 @@ async function sendAdsReport(chatId) {
       }
     }
     if (ads.length > 20) msg += `\n<i>Первые 20 из ${ads.length}</i>`;
+
+    // Account switcher
+    if (AD_ACCOUNT2) {
+      const otherAcc = accId === AD_ACCOUNT ? AD_ACCOUNT2 : AD_ACCOUNT;
+      const otherLabel = accId === AD_ACCOUNT ? 'Кабинет 2' : 'Кабинет 1';
+      keyboard.push([{ text: `🔄 Переключить → ${otherLabel}`, callback_data: `switch_account:${otherAcc}:ads` }]);
+    }
 
     await sendLongMessage(chatId, msg, keyboard);
   } catch (e) {
@@ -2208,8 +2257,8 @@ const ADD_FUNDS_URL  = 'https://www.facebook.com/ads/manager/billing/payment_met
 let lastBillingStatus = 1; // track changes
 let billingAlertSentToday = false;
 
-async function checkBilling(silent = false) {
-  const data = await metaGet(`/${AD_ACCOUNT}`, {
+async function checkBilling(silent = false, accountId = AD_ACCOUNT) {
+  const data = await metaGet(`/${accountId}`, {
     fields: 'balance,amount_spent,spend_cap,account_status,currency,funding_source_details',
   }).catch(() => null);
   if (!data) return null;
@@ -2283,26 +2332,36 @@ async function checkBilling(silent = false) {
   };
 }
 
-// ── /billing command: show full billing status ────────────────
+// ── /billing command: show full billing status (all accounts) ─
 async function sendBillingReport(chatId) {
-  const b = await checkBilling(true);
-  if (!b) {
-    await safeSend(chatId, '❌ Не удалось получить данные биллинга.');
-    return;
-  }
   const today = new Date().toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' });
-  let msg = `💳 <b>Биллинг Meta Ads</b>\n<i>${today}</i>\n──────────────\n\n`;
-  msg += `${b.statusInfo.emoji} Статус: <b>${b.statusInfo.label}</b>\n`;
-  msg += `💳 Карта: <b>${b.card}</b>\n`;
-  if (b.balanceUSD > 0) msg += `💰 Баланс: <b>$${fmt(b.balanceUSD)}</b>\n`;
-  msg += `📊 Потрачено всего: <b>$${fmt(b.spentUSD)}</b>\n`;
-  if (b.capUSD > 0) {
-    const pct = ((b.spentUSD / b.capUSD) * 100).toFixed(0);
-    msg += `🔒 Лимит расходов: <b>$${fmt(b.capUSD)}</b> (использовано ${pct}%)\n`;
-  }
-  msg += `\nЧтобы пополнить счёт — открой биллинг Meta:`;
+  let msg = `💳 <b>Биллинг Meta Ads</b>\n<i>${today}</i>\n`;
 
-  await safeSend(chatId, msg, { reply_markup: { inline_keyboard: b.keyboard } });
+  const billingKeyboard = [[
+    { text: '💳 Биллинг Meta', url: BILLING_URL },
+    { text: '➕ Пополнить', url: ADD_FUNDS_URL },
+  ]];
+
+  for (const accId of ALL_ACCOUNTS) {
+    const b = await checkBilling(true, accId).catch(() => null);
+    const label = accId === AD_ACCOUNT ? '🏦 Кабинет 1' : '🏦 Кабинет 2';
+    msg += `\n──────────────\n${label} <code>${accId}</code>\n`;
+    if (!b) {
+      msg += `❌ Нет данных\n`;
+      continue;
+    }
+    msg += `${b.statusInfo.emoji} Статус: <b>${b.statusInfo.label}</b>\n`;
+    msg += `💳 Карта: <b>${b.card}</b>\n`;
+    if (b.balanceUSD > 0) msg += `💰 Баланс: <b>$${fmt(b.balanceUSD)}</b>\n`;
+    msg += `📊 Потрачено всего: <b>$${fmt(b.spentUSD)}</b>\n`;
+    if (b.capUSD > 0) {
+      const pct = ((b.spentUSD / b.capUSD) * 100).toFixed(0);
+      msg += `🔒 Лимит: <b>$${fmt(b.capUSD)}</b> (${pct}%)\n`;
+    }
+  }
+
+  msg += `\nЧтобы пополнить счёт — открой биллинг Meta:`;
+  await safeSend(chatId, msg, { reply_markup: { inline_keyboard: billingKeyboard } });
 }
 
 // ── Wire up schedule ──────────────────────────────────────────
@@ -2310,12 +2369,14 @@ scheduleDaily(9,  0,  sendMorningReport,                       'morning');
 scheduleDaily(13, 0,  sendDayCheck,                            'check-13');
 scheduleDaily(18, 0,  async () => { await sendDayCheck(); await sendWeeklySummary(); }, 'check-18');
 
-// Billing check every 6 hours (catches issues between morning reports)
+// Billing check every 6 hours for ALL accounts
 function scheduleBillingCheck() {
   const CHECK_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
   setInterval(async () => {
-    try { await checkBilling(); }
-    catch (e) { console.warn('⚠️ billing check error:', e.message); }
+    for (const accId of ALL_ACCOUNTS) {
+      try { await checkBilling(false, accId); }
+      catch (e) { console.warn(`⚠️ billing check error [${accId}]:`, e.message); }
+    }
   }, CHECK_INTERVAL);
 }
 scheduleBillingCheck();
